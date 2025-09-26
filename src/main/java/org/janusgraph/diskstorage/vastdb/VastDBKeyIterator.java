@@ -38,24 +38,39 @@ import java.util.Map;
  * with an in-memory index for efficient key scanning.
  */
 public class VastDBKeyIterator implements KeyIterator {
-    
+
     private static final Logger log = LoggerFactory.getLogger(VastDBKeyIterator.class);
-    
-    private final KeyRangeQuery query;
+
+    private final KeyRangeQuery keyRangeQuery;
+    private final SliceQuery sliceQuery;
     private final Map<StaticBuffer, Map<StaticBuffer, Entry>> memoryIndex;
-    
+
     private final Iterator<StaticBuffer> keyIterator;
     private StaticBuffer currentKey;
     private boolean closed = false;
-    
-    public VastDBKeyIterator(List<StaticBuffer> keys, KeyRangeQuery query, 
-                            Map<StaticBuffer, Map<StaticBuffer, Entry>> memoryIndex) 
+
+    // Constructor for KeyRangeQuery
+    public VastDBKeyIterator(List<StaticBuffer> keys, KeyRangeQuery query,
+                             Map<StaticBuffer, Map<StaticBuffer, Entry>> memoryIndex)
             throws BackendException {
-        this.query = query;
+        this.keyRangeQuery = query;
+        this.sliceQuery = query; // KeyRangeQuery is a SliceQuery or compatible
         this.memoryIndex = memoryIndex;
         this.keyIterator = keys.iterator();
-        
-        log.debug("Created key iterator for {} keys", keys.size());
+
+        log.debug("Created key iterator for {} keys (KeyRangeQuery)", keys.size());
+    }
+
+    // Constructor for SliceQuery
+    public VastDBKeyIterator(List<StaticBuffer> keys, SliceQuery query,
+                             Map<StaticBuffer, Map<StaticBuffer, Entry>> memoryIndex)
+            throws BackendException {
+        this.keyRangeQuery = null;
+        this.sliceQuery = query;
+        this.memoryIndex = memoryIndex;
+        this.keyIterator = keys.iterator();
+
+        log.debug("Created key iterator for {} keys (SliceQuery)", keys.size());
     }
     
     @Override
@@ -107,28 +122,28 @@ public class VastDBKeyIterator implements KeyIterator {
      */
     private List<Entry> loadEntriesForKey(StaticBuffer key) {
         List<Entry> entries = new ArrayList<>();
-        
+
         Map<StaticBuffer, Entry> keyEntries = memoryIndex.get(key);
         if (keyEntries == null) {
             return entries;
         }
-        
-        SliceQuery slice = query.getSliceQuery();
-        
+
+        SliceQuery slice = this.sliceQuery;
+
         // Filter entries by slice constraints
         for (Map.Entry<StaticBuffer, Entry> entry : keyEntries.entrySet()) {
             StaticBuffer column = entry.getKey();
             Entry value = entry.getValue();
-            
+
             // Check if column is within slice range
             if (isColumnInSlice(column, slice)) {
                 entries.add(value);
             }
         }
-        
+
         // Sort entries by column
         entries.sort((e1, e2) -> e1.getColumn().compareTo(e2.getColumn()));
-        
+
         // Apply limit if specified
         if (slice.hasLimit()) {
             int limit = slice.getLimit();
@@ -136,7 +151,7 @@ public class VastDBKeyIterator implements KeyIterator {
                 entries = entries.subList(0, limit);
             }
         }
-        
+
         return entries;
     }
     

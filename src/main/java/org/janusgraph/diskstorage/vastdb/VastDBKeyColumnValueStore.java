@@ -47,6 +47,7 @@ import org.janusgraph.diskstorage.util.RecordIterator;
 import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.janusgraph.diskstorage.EntryList;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -131,9 +132,8 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             // Define schema for JanusGraph KCV store:
             // vastdb_rowid (UInt64) - automatically added by VAST
             // key (Binary) - the row key
-            // column (Binary) - the column name  
-            // value (Binary) - the column value
-            // timestamp (UInt64) - modification timestamp
+            // column (Binary) - the column value
+            // timestamp (Binary) - modification timestamp
             
             List<Field> fields = List.of(
                 ArrowSchemaUtils.VASTDB_ROW_ID_FIELD, // Required for External RowID
@@ -184,8 +184,8 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
         
         try {
             StaticBuffer key = query.getKey();
-            SliceQuery slice = query.getSliceQuery();
-            
+            SliceQuery slice = query;
+
             // Get entries from memory index
             Map<StaticBuffer, Entry> keyEntries = memoryIndex.get(key);
             if (keyEntries == null) {
@@ -217,7 +217,6 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             }
             
             return new EntryArrayList(entries);
-            
         } catch (Exception e) {
             throw convertException(e);
         }
@@ -299,21 +298,29 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             keys.sort(StaticBuffer::compareTo);
             
             return new VastDBKeyIterator(keys, query, memoryIndex);
-            
         } catch (Exception e) {
             throw convertException(e);
         }
     }
-    
+
+    @Override
+    public org.janusgraph.diskstorage.keycolumnvalue.KeySlicesIterator getKeys(org.janusgraph.diskstorage.keycolumnvalue.MultiSlicesQuery query, StoreTransaction txh) throws BackendException {
+        throw new UnsupportedOperationException("MultiSliceQuery is not supported by VAST DB backend");
+    }
+
     @Override
     public KeyIterator getKeys(SliceQuery query, StoreTransaction txh) throws BackendException {
-        // Convert to a full range query
-        KeyRangeQuery keyQuery = new KeyRangeQuery(
-            StaticBuffer.EMPTY_BUFFER, 
-            null, 
-            query
-        );
-        return getKeys(keyQuery, txh);
+        Preconditions.checkNotNull(query);
+        ensureInitialized();
+
+        try {
+            // Return an iterator over all keys in memoryIndex for the given slice query
+            List<StaticBuffer> keys = new ArrayList<>(memoryIndex.keySet());
+            keys.sort(StaticBuffer::compareTo);
+            return new VastDBKeyIterator(keys, query, memoryIndex);
+        } catch (Exception e) {
+            throw convertException(e);
+        }
     }
     
     @Override
@@ -330,7 +337,7 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             memoryIndex.clear();
             log.info("Closed VAST DB store: {}", tableName);
         } catch (Exception e) {
-            throw new PermanentBackendException("Failed to close store: " + tableName, e);
+            throw new PermanentBackendException("Failed to close store: " + tableName);
         }
     }
     
@@ -384,7 +391,7 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             // Create Arrow vectors for the batch
             VarBinaryVector keyVector = new VarBinaryVector("key", allocator);
             VarBinaryVector columnVector = new VarBinaryVector("column", allocator);
-            VarBinaryVector valueVector = new VarBinaryVector("value", allocator);
+            VarBinaryVector valueVector = new VarBinaryVector("valueVector", allocator);
             UInt8Vector timestampVector = new UInt8Vector("timestamp", allocator);
             
             keyVector.allocateNew(additions.size());
@@ -399,7 +406,7 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
                 keyVector.set(i, key.as(StaticBuffer.ARRAY_FACTORY));
                 columnVector.set(i, entry.getColumn().as(StaticBuffer.ARRAY_FACTORY));
                 valueVector.set(i, entry.getValue().as(StaticBuffer.ARRAY_FACTORY));
-                timestampVector.set(i, entry.hasTimestamp() ? entry.getTimestamp() : timestamp);
+                timestampVector.set(i, timestamp);
             }
             
             keyVector.setValueCount(additions.size());
@@ -441,7 +448,7 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
         if (e instanceof VastException) {
             return new TemporaryBackendException("VAST DB operation failed", e);
         } else if (e instanceof BackendException) {
-            return (BackendException) e;
+            return new PermanentBackendException("Unexpected error", e);
         } else {
             return new PermanentBackendException("Unexpected error", e);
         }

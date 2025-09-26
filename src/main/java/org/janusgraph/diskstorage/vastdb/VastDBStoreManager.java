@@ -38,6 +38,7 @@ import org.janusgraph.diskstorage.keycolumnvalue.StoreFeatures;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.janusgraph.diskstorage.util.time.TimestampProviders;
 
 import java.net.URI;
 import java.time.temporal.ChronoUnit;
@@ -98,13 +99,12 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
             .keyOrdered(true)
             .persists(true)
             .optimisticLocking(configuration.get(VASTDB_ENABLE_OPTIMISTIC_LOCKING))
-            .keyConsistent(true)
+            .keyConsistent(configuration)
             .locking(false)  // VAST DB doesn't support distributed locking
-            .txIsolation(configuration.get(VASTDB_ISOLATION_LEVEL))
             .supportsInterruption(false)
             .cellTTL(false)  // VAST DB doesn't natively support TTL
             .timestamps(true)
-            .preferredTimestamps(PREFERRED_TIMESTAMPS)
+            .preferredTimestamps(TimestampProviders.MICRO)
             .multiQuery(true)
             .batchMutation(true)
             .localKeyPartition(false)
@@ -213,29 +213,34 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
     @Override
     public KeyColumnValueStore openDatabase(String name) throws BackendException {
         Preconditions.checkNotNull(name);
-        
+
         if (stores.containsKey(name)) {
             return stores.get(name);
         }
-        
+
         try {
             VastDBKeyColumnValueStore store = new VastDBKeyColumnValueStore(
-                vastSdk, 
-                keyspace, 
-                name, 
+                vastSdk,
+                keyspace,
+                name,
                 storageConfig,
                 this
             );
-            
+
             stores.put(name, store);
             return store;
-            
+
         } catch (Exception e) {
             throw new PermanentBackendException("Failed to open store: " + name, e);
         }
     }
-    
+
     @Override
+    public KeyColumnValueStore openDatabase(String name, org.janusgraph.diskstorage.StoreMetaData.Container metaData) throws BackendException {
+        // Delegate to the single-argument version, ignoring metaData
+        return openDatabase(name);
+    }
+
     public List<KeyColumnValueStore> openDatabases(String... names) throws BackendException {
         List<KeyColumnValueStore> stores = new java.util.ArrayList<>();
         for (String name : names) {
@@ -243,6 +248,7 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
         }
         return stores;
     }
+
     
     @Override
     public void mutateMany(Map<String, Map<StaticBuffer, org.janusgraph.diskstorage.keycolumnvalue.KCVMutation>> mutations, 
@@ -279,7 +285,13 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
         return keyspace;
     }
     
-    public VastDBTransactionManager getTransactionManager() {
+public VastDBTransactionManager getTransactionManager() {
         return transactionManager;
+    }
+
+    @Override
+    public java.util.List<org.janusgraph.diskstorage.keycolumnvalue.KeyRange> getLocalKeyPartition() {
+        // Local key partitioning is not supported for VastDB
+        return java.util.Collections.emptyList();
     }
 }

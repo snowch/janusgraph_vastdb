@@ -81,13 +81,6 @@ public interface VastDBConfigOptions {
         false
     );
     
-    ConfigOption<StoreFeatures.TransactionIsolation> VASTDB_ISOLATION_LEVEL = new ConfigOption<>(
-        VASTDB_NS,
-        "isolation-level",
-        "Transaction isolation level",
-        ConfigOption.Type.MASKABLE,
-        StoreFeatures.TransactionIsolation.READ_COMMITTED
-    );
     
     ConfigOption<Integer> VASTDB_CONNECTION_TIMEOUT_MS = new ConfigOption<>(
         VASTDB_NS,

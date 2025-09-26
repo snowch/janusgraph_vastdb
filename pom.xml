@@ -19,15 +19,57 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         
         <!-- Dependency versions -->
-        <janusgraph.version>1.0.0</janusgraph.version>
+        <janusgraph.version>1.1.0</janusgraph.version>
         <vastdb.version>5.3.0.1</vastdb.version>
         <arrow.version>13.0.0</arrow.version>
         <airlift.version>206</airlift.version>
         <junit.version>5.9.3</junit.version>
-        <logback.version>1.4.11</logback.version>
-        <slf4j.version>2.0.7</slf4j.version>
+        <logback.version>1.4.14</logback.version>
+        <slf4j.version>2.0.9</slf4j.version>
         <guava.version>32.1.2-jre</guava.version>
     </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Force consistent versions to avoid conflicts -->
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-classic</artifactId>
+                <version>${logback.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-core</artifactId>
+                <version>${logback.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>${guava.version}</version>
+            </dependency>
+            <!-- Arrow version management -->
+            <dependency>
+                <groupId>org.apache.arrow</groupId>
+                <artifactId>arrow-memory-core</artifactId>
+                <version>${arrow.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.arrow</groupId>
+                <artifactId>arrow-vector</artifactId>
+                <version>${arrow.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.arrow</groupId>
+                <artifactId>arrow-memory-netty</artifactId>
+                <version>${arrow.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <!-- JanusGraph Core -->
@@ -35,6 +77,17 @@
             <groupId>org.janusgraph</groupId>
             <artifactId>janusgraph-core</artifactId>
             <version>${janusgraph.version}</version>
+            <exclusions>
+                <!-- Exclude conflicting logging dependencies -->
+                <exclusion>
+                    <groupId>ch.qos.logback</groupId>
+                    <artifactId>logback-classic</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-log4j12</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         
         <!-- VAST Database SDK -->
@@ -42,29 +95,43 @@
             <groupId>com.vastdata.vdb</groupId>
             <artifactId>sdk</artifactId>
             <version>${vastdb.version}</version>
+            <exclusions>
+                <!-- Exclude potentially conflicting dependencies -->
+                <exclusion>
+                    <groupId>ch.qos.logback</groupId>
+                    <artifactId>logback-classic</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-log4j12</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         
         <dependency>
             <groupId>ndb</groupId>
             <artifactId>ndb-common</artifactId>
             <version>${vastdb.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>ch.qos.logback</groupId>
+                    <artifactId>logback-classic</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- Apache Arrow dependencies -->
         <dependency>
             <groupId>org.apache.arrow</groupId>
             <artifactId>arrow-memory-core</artifactId>
-            <version>${arrow.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.arrow</groupId>
             <artifactId>arrow-vector</artifactId>
-            <version>${arrow.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.arrow</groupId>
             <artifactId>arrow-memory-netty</artifactId>
-            <version>${arrow.version}</version>
         </dependency>
 
         <!-- HTTP Client for VAST SDK -->
@@ -83,21 +150,17 @@
         <dependency>
             <groupId>com.google.guava</groupId>
             <artifactId>guava</artifactId>
-            <version>${guava.version}</version>
         </dependency>
 
-        <!-- Logging -->
+        <!-- Logging - explicitly manage versions -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
-            <version>${slf4j.version}</version>
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
-            <version>${logback.version}</version>
-            <scope>runtime</scope>
-            <optional>true</optional>
+            <scope>test</scope>
         </dependency>
 
         <!-- Test Dependencies -->
@@ -120,15 +183,19 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- JanusGraph Test Utils (may not be available in public repos) -->
-        <!--
+        <!-- Mockito for testing -->
         <dependency>
-            <groupId>org.janusgraph</groupId>
-            <artifactId>janusgraph-backend-testutils</artifactId>
-            <version>${janusgraph.version}</version>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.5.0</version>
             <scope>test</scope>
         </dependency>
-        -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>5.5.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <repositories>
@@ -184,6 +251,11 @@
                         <vastdb.awsAccessKeyId>${vastdb.awsAccessKeyId}</vastdb.awsAccessKeyId>
                         <vastdb.awsSecretAccessKey>${vastdb.awsSecretAccessKey}</vastdb.awsSecretAccessKey>
                     </systemPropertyVariables>
+                    <!-- Add JVM arguments for better test stability -->
+                    <argLine>-Xmx1024m -XX:+HeapDumpOnOutOfMemoryError</argLine>
+                    <!-- Force single-threaded test execution to avoid conflicts -->
+                    <forkCount>1</forkCount>
+                    <reuseForks>false</reuseForks>
                 </configuration>
             </plugin>
 
@@ -271,6 +343,24 @@
                     <failOnError>false</failOnError>
                 </configuration>
             </plugin>
+
+            <!-- Dependency analysis plugin to help identify conflicts -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <id>analyze-duplicate</id>
+                        <goals>
+                            <goal>analyze-duplicate</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <downloadSources>true</downloadSources>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 
@@ -285,6 +375,30 @@
                         <configuration>
                             <groups>integration</groups>
                         </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        
+        <profile>
+            <id>debug-dependencies</id>
+            <activation>
+                <activeByDefault>false</activeByDefault>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-dependency-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>tree</id>
+                                <phase>compile</phase>
+                                <goals>
+                                    <goal>tree</goal>
+                                </goals>
+                            </execution>
+                        </executions>
                     </plugin>
                 </plugins>
             </build>
