@@ -14,72 +14,48 @@
 
 package org.janusgraph.diskstorage.vastdb;
 
-import com.vastdata.vdb.sdk.Table;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VarBinaryVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.types.pojo.Schema;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.Entry;
-import org.janusgraph.diskstorage.PermanentBackendException;
 import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyIterator;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyRangeQuery;
+import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
 import org.janusgraph.diskstorage.util.EntryArrayList;
 import org.janusgraph.diskstorage.util.RecordIterator;
-import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 
 /**
  * Iterator implementation for scanning keys in VAST DB tables.
  * 
- * This iterator provides efficient scanning over keys in a key range,
- * supporting both bounded and unbounded scans.
+ * Since VAST DB doesn't support SQL-like queries, this iterator works
+ * with an in-memory index for efficient key scanning.
  */
 public class VastDBKeyIterator implements KeyIterator {
     
     private static final Logger log = LoggerFactory.getLogger(VastDBKeyIterator.class);
     
     private final KeyRangeQuery query;
-    private final Table table;
-    private final Schema schema;
-    private final RootAllocator allocator;
+    private final Map<StaticBuffer, Map<StaticBuffer, Entry>> memoryIndex;
     
-    private Iterator<StaticBuffer> keyIterator;
+    private final Iterator<StaticBuffer> keyIterator;
     private StaticBuffer currentKey;
     private boolean closed = false;
     
-    // Batch processing
-    private static final int BATCH_SIZE = 1000;
-    private long currentOffset = 0;
-    
-    public VastDBKeyIterator(KeyRangeQuery query, Table table, Schema schema, RootAllocator allocator) 
+    public VastDBKeyIterator(List<StaticBuffer> keys, KeyRangeQuery query, 
+                            Map<StaticBuffer, Map<StaticBuffer, Entry>> memoryIndex) 
             throws BackendException {
         this.query = query;
-        this.table = table;
-        this.schema = schema;
-        this.allocator = allocator;
+        this.memoryIndex = memoryIndex;
+        this.keyIterator = keys.iterator();
         
-        initialize();
-    }
-    
-    private void initialize() throws BackendException {
-        try {
-            // Load the first batch of keys
-            List<StaticBuffer> keys = loadNextBatch();
-            this.keyIterator = keys.iterator();
-            
-        } catch (Exception e) {
-            throw new PermanentBackendException("Failed to initialize key iterator", e);
-        }
+        log.debug("Created key iterator for {} keys", keys.size());
     }
     
     @Override
@@ -88,25 +64,7 @@ public class VastDBKeyIterator implements KeyIterator {
             return false;
         }
         
-        try {
-            // If current iterator has more keys, return true
-            if (keyIterator.hasNext()) {
-                return true;
-            }
-            
-            // Try to load next batch
-            List<StaticBuffer> nextBatch = loadNextBatch();
-            if (!nextBatch.isEmpty()) {
-                keyIterator = nextBatch.iterator();
-                return keyIterator.hasNext();
-            }
-            
-            return false;
-            
-        } catch (Exception e) {
-            log.error("Error checking hasNext in key iterator", e);
-            return false;
-        }
+        return keyIterator.hasNext();
     }
     
     @Override
@@ -140,174 +98,64 @@ public class VastDBKeyIterator implements KeyIterator {
     public void close() throws IOException {
         if (!closed) {
             closed = true;
-            
-            // Clean up resources
-            if (allocator != null) {
-                try {
-                    allocator.close();
-                } catch (Exception e) {
-                    log.warn("Failed to close allocator in key iterator", e);
-                }
-            }
-            
             log.debug("Closed VAST DB key iterator");
         }
     }
     
     /**
-     * Load the next batch of keys from VAST DB.
+     * Load all entries for a specific key that match the slice query.
      */
-    private List<StaticBuffer> loadNextBatch() throws BackendException {
-        try {
-            List<StaticBuffer> keys = new ArrayList<>();
+    private List<Entry> loadEntriesForKey(StaticBuffer key) {
+        List<Entry> entries = new ArrayList<>();
+        
+        Map<StaticBuffer, Entry> keyEntries = memoryIndex.get(key);
+        if (keyEntries == null) {
+            return entries;
+        }
+        
+        SliceQuery slice = query.getSliceQuery();
+        
+        // Filter entries by slice constraints
+        for (Map.Entry<StaticBuffer, Entry> entry : keyEntries.entrySet()) {
+            StaticBuffer column = entry.getKey();
+            Entry value = entry.getValue();
             
-            // In a real implementation, this would:
-            // 1. Query VAST DB for distinct keys in the range [query.getKeyStart(), query.getKeyEnd())
-            // 2. Apply LIMIT and OFFSET for pagination
-            // 3. Return the keys as StaticBuffer objects
-            
-            // For now, we'll return an empty list to indicate no more keys
-            // A full implementation would construct a proper query and execute it
-            
-            log.debug("Loading next batch of keys from offset: {}", currentOffset);
-            
-            // Simulate loading keys (in real implementation, this would query VAST DB)
-            VectorSchemaRoot results = queryDistinctKeys(currentOffset, BATCH_SIZE);
-            
-            if (results != null) {
-                keys.addAll(extractKeysFromResults(results));
-                results.close();
+            // Check if column is within slice range
+            if (isColumnInSlice(column, slice)) {
+                entries.add(value);
             }
-            
-            currentOffset += BATCH_SIZE;
-            
-            return keys;
-            
-        } catch (Exception e) {
-            throw new PermanentBackendException("Failed to load key batch", e);
         }
-    }
-    
-    /**
-     * Query VAST DB for distinct keys in the specified range.
-     */
-    private VectorSchemaRoot queryDistinctKeys(long offset, int limit) {
-        try {
-            // This would construct and execute a query like:
-            // SELECT DISTINCT key FROM table 
-            // WHERE key >= query.getKeyStart() AND key < query.getKeyEnd()
-            // ORDER BY key
-            // LIMIT limit OFFSET offset
-            
-            // For now, return null to indicate no results
-            // A full implementation would use the VAST SDK to execute this query
-            
-            return null;
-            
-        } catch (Exception e) {
-            log.warn("Failed to query distinct keys", e);
-            return null;
-        }
-    }
-    
-    /**
-     * Extract keys from Arrow query results.
-     */
-    private List<StaticBuffer> extractKeysFromResults(VectorSchemaRoot results) {
-        List<StaticBuffer> keys = new ArrayList<>();
-        Set<StaticBuffer> uniqueKeys = new HashSet<>();  // Ensure uniqueness
         
-        try {
-            VarBinaryVector keyVector = (VarBinaryVector) results.getVector("key");
-            
-            for (int i = 0; i < results.getRowCount(); i++) {
-                if (!keyVector.isNull(i)) {
-                    byte[] keyBytes = keyVector.get(i);
-                    StaticBuffer key = new StaticArrayBuffer(keyBytes);
-                    
-                    // Apply key range filter
-                    if (isKeyInRange(key)) {
-                        uniqueKeys.add(key);
-                    }
-                }
+        // Sort entries by column
+        entries.sort((e1, e2) -> e1.getColumn().compareTo(e2.getColumn()));
+        
+        // Apply limit if specified
+        if (slice.hasLimit()) {
+            int limit = slice.getLimit();
+            if (entries.size() > limit) {
+                entries = entries.subList(0, limit);
             }
-            
-            keys.addAll(uniqueKeys);
-            keys.sort(StaticBuffer::compareTo);  // Ensure ordering
-            
-        } catch (Exception e) {
-            log.warn("Failed to extract keys from results", e);
         }
         
-        return keys;
+        return entries;
     }
     
     /**
-     * Check if a key is within the query range.
+     * Check if a column is within the slice range.
      */
-    private boolean isKeyInRange(StaticBuffer key) {
-        StaticBuffer keyStart = query.getKeyStart();
-        StaticBuffer keyEnd = query.getKeyEnd();
+    private boolean isColumnInSlice(StaticBuffer column, SliceQuery slice) {
+        StaticBuffer sliceStart = slice.getSliceStart();
+        StaticBuffer sliceEnd = slice.getSliceEnd();
         
-        if (keyStart != null && key.compareTo(keyStart) < 0) {
+        if (sliceStart != null && sliceStart.length() > 0 && column.compareTo(sliceStart) < 0) {
             return false;
         }
         
-        if (keyEnd != null && key.compareTo(keyEnd) >= 0) {
+        if (sliceEnd != null && sliceEnd.length() > 0 && column.compareTo(sliceEnd) >= 0) {
             return false;
         }
         
         return true;
-    }
-    
-    /**
-     * Load all entries for a specific key that match the slice query.
-     */
-    private List<Entry> loadEntriesForKey(StaticBuffer key) throws BackendException {
-        try {
-            // Query VAST DB for all columns/values for this key within the slice range
-            // This would be similar to:
-            // SELECT column, value, timestamp FROM table 
-            // WHERE key = key AND column >= sliceStart AND column < sliceEnd
-            // ORDER BY column
-            
-            VectorSchemaRoot results = queryEntriesForKey(key);
-            
-            if (results != null) {
-                List<Entry> entries = parseResultsToEntries(results);
-                results.close();
-                return entries;
-            }
-            
-            return new ArrayList<>();
-            
-        } catch (Exception e) {
-            throw new PermanentBackendException("Failed to load entries for key: " + key, e);
-        }
-    }
-    
-    /**
-     * Query VAST DB for entries matching a specific key.
-     */
-    private VectorSchemaRoot queryEntriesForKey(StaticBuffer key) {
-        try {
-            // Implementation would query VAST DB for entries matching the key
-            // and within the slice query column range
-            
-            return null;  // Placeholder
-            
-        } catch (Exception e) {
-            log.warn("Failed to query entries for key: " + key, e);
-            return null;
-        }
-    }
-    
-    /**
-     * Parse Arrow results into Entry objects.
-     */
-    private List<Entry> parseResultsToEntries(VectorSchemaRoot results) {
-        // This would be similar to the implementation in VastDBKeyColumnValueStore
-        return new ArrayList<>();  // Placeholder
     }
     
     /**

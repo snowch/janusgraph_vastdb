@@ -15,7 +15,12 @@
 package org.janusgraph.diskstorage.vastdb;
 
 import com.google.common.base.Preconditions;
+import com.vastdata.client.VastClient;
 import com.vastdata.client.error.VastException;
+import com.vastdata.client.schema.ArrowSchemaUtils;
+import com.vastdata.client.schema.CreateTableContext;
+import com.vastdata.client.schema.StartTransactionContext;
+import com.vastdata.client.tx.SimpleVastTransaction;
 import com.vastdata.vdb.sdk.NoExternalRowIdColumnException;
 import com.vastdata.vdb.sdk.Table;
 import com.vastdata.vdb.sdk.VastSdk;
@@ -45,6 +50,8 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -66,8 +73,11 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
     private Schema tableSchema;
     private boolean isInitialized = false;
     
-    // Cache for row IDs to avoid multiple lookups
-    private final Map<StaticBuffer, Long> keyToRowIdCache = new ConcurrentHashMap<>();
+    // In-memory storage for the KCV data since VAST DB doesn't support SQL queries
+    // In a production implementation, this would need to be replaced with a proper
+    // indexing and scanning mechanism
+    private final Map<StaticBuffer, Map<StaticBuffer, Entry>> memoryIndex = new ConcurrentHashMap<>();
+    private long nextRowId = 0;
     
     public VastDBKeyColumnValueStore(VastSdk vastSdk, String keyspace, String tableName, 
                                     Configuration configuration, VastDBStoreManager storeManager) 
@@ -95,8 +105,12 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
                 this.tableSchema = table.getSchema();
                 isInitialized = true;
                 log.info("Loaded existing table schema for {}/{}", keyspace, fullTableName);
+                
+                // TODO: Load existing data into memory index if needed
+                loadExistingData();
+                
             } catch (NoExternalRowIdColumnException | RuntimeException e) {
-                // Table doesn't exist or has wrong schema - create it
+                // Table doesn't exist - create it
                 if (configuration.get(VASTDB_AUTO_CREATE_TABLES)) {
                     createTable(fullTableName);
                 } else {
@@ -115,39 +129,52 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             log.info("Creating new table: {}/{}", keyspace, fullTableName);
             
             // Define schema for JanusGraph KCV store:
-            // vastdb_rowid (UInt64) - automatically added
+            // vastdb_rowid (UInt64) - automatically added by VAST
             // key (Binary) - the row key
-            // column (Binary) - the column name
+            // column (Binary) - the column name  
             // value (Binary) - the column value
             // timestamp (UInt64) - modification timestamp
             
             List<Field> fields = List.of(
+                ArrowSchemaUtils.VASTDB_ROW_ID_FIELD, // Required for External RowID
                 new Field("key", FieldType.nullable(ArrowType.Binary.INSTANCE), null),
-                new Field("column", FieldType.nullable(ArrowType.Binary.INSTANCE), null),
+                new Field("column", FieldType.nullable(ArrowType.Binary.INSTANCE), null), 
                 new Field("value", FieldType.nullable(ArrowType.Binary.INSTANCE), null),
                 new Field("timestamp", FieldType.nullable(new ArrowType.Int(64, false)), null)
             );
             
-            this.tableSchema = new Schema(fields);
+            // Use internal VAST client to create table
+            VastClient client = vastSdk.getVastClient();
+            VastDBTransactionManager txManager = storeManager.getTransactionManager();
             
-            // Create table using internal VastClient API (similar to example)
-            // This would need to be implemented using the VastClient from the SDK
-            createTableInVastDB(fullTableName, fields);
+            SimpleVastTransaction tx = txManager.startTransaction(
+                new StartTransactionContext(false, false));
             
-            // Now load the schema
+            client.createTable(tx, new CreateTableContext(keyspace, fullTableName, fields, null, null));
+            txManager.commit(tx);
+            
+            // Now load the schema (excluding vastdb_rowid for our operations)
             table.loadSchema();
+            this.tableSchema = table.getSchema();
             isInitialized = true;
+            
+            log.info("Successfully created table: {}/{}", keyspace, fullTableName);
             
         } catch (Exception e) {
             throw new PermanentBackendException("Failed to create table: " + fullTableName, e);
         }
     }
     
-    private void createTableInVastDB(String fullTableName, List<Field> fields) throws VastException {
-        // This would use the internal VastClient API similar to the example
-        // to create a table with the vastdb_rowid column for External RowID with Internal allocation
-        log.info("Creating table in VAST DB: {}", fullTableName);
-        // Implementation would use VastClient.createTable() 
+    private void loadExistingData() throws BackendException {
+        // Since VAST DB doesn't support full table scans via SQL,
+        // we can't easily load existing data into our memory index.
+        // In a production implementation, you would need to:
+        // 1. Maintain a separate index table/structure
+        // 2. Use external indexing system  
+        // 3. Or implement a scanning mechanism using the VAST SDK
+        
+        log.warn("Loading existing data not fully implemented - starting with empty index");
+        // For now, start with empty memory index
     }
     
     @Override
@@ -159,17 +186,34 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             StaticBuffer key = query.getKey();
             SliceQuery slice = query.getSliceQuery();
             
-            // Find all rows for this key within the column range
+            // Get entries from memory index
+            Map<StaticBuffer, Entry> keyEntries = memoryIndex.get(key);
+            if (keyEntries == null) {
+                return new EntryArrayList();
+            }
+            
             List<Entry> entries = new ArrayList<>();
             
-            // In a real implementation, this would query VAST DB for all rows where:
-            // key = query.getKey() AND column >= slice.getSliceStart() AND column <= slice.getSliceEnd()
-            // For now, we'll do a simplified approach
+            // Filter by slice range
+            for (Map.Entry<StaticBuffer, Entry> entry : keyEntries.entrySet()) {
+                StaticBuffer column = entry.getKey();
+                Entry value = entry.getValue();
+                
+                // Check if column is within slice range
+                if (isColumnInSlice(column, slice)) {
+                    entries.add(value);
+                }
+            }
             
-            VectorSchemaRoot results = queryRowsForKey(key, slice);
-            if (results != null) {
-                entries.addAll(parseResultsToEntries(results));
-                results.close();
+            // Sort entries by column
+            entries.sort((e1, e2) -> e1.getColumn().compareTo(e2.getColumn()));
+            
+            // Apply limit if specified
+            if (slice.hasLimit()) {
+                int limit = slice.getLimit();
+                if (entries.size() > limit) {
+                    entries = entries.subList(0, limit);
+                }
             }
             
             return new EntryArrayList(entries);
@@ -186,7 +230,7 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
         Preconditions.checkNotNull(query);
         ensureInitialized();
         
-        Map<StaticBuffer, EntryList> result = new java.util.HashMap<>();
+        Map<StaticBuffer, EntryList> result = new HashMap<>();
         
         for (StaticBuffer key : keys) {
             KeySliceQuery ksq = new KeySliceQuery(key, query);
@@ -206,14 +250,23 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
         try {
             long timestamp = System.currentTimeMillis();
             
-            // Handle deletions first
+            // Update memory index first
+            Map<StaticBuffer, Entry> keyEntries = memoryIndex.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
+            
+            // Handle deletions
             if (deletions != null && !deletions.isEmpty()) {
-                performDeletions(key, deletions, timestamp);
+                for (StaticBuffer column : deletions) {
+                    keyEntries.remove(column);
+                }
+                performDeletionsInVastDB(key, deletions, timestamp);
             }
             
             // Handle additions
             if (additions != null && !additions.isEmpty()) {
-                performAdditions(key, additions, timestamp);
+                for (Entry entry : additions) {
+                    keyEntries.put(entry.getColumn(), entry);
+                }
+                performAdditionsInVastDB(key, additions, timestamp);
             }
             
         } catch (Exception e) {
@@ -234,8 +287,18 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
         ensureInitialized();
         
         try {
-            // Return an iterator over all keys in the specified range
-            return new VastDBKeyIterator(query, table, tableSchema, allocator);
+            // Return an iterator over keys from memory index
+            List<StaticBuffer> keys = new ArrayList<>();
+            
+            for (StaticBuffer key : memoryIndex.keySet()) {
+                if (isKeyInRange(key, query)) {
+                    keys.add(key);
+                }
+            }
+            
+            keys.sort(StaticBuffer::compareTo);
+            
+            return new VastDBKeyIterator(keys, query, memoryIndex);
             
         } catch (Exception e) {
             throw convertException(e);
@@ -264,76 +327,56 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             if (allocator != null) {
                 allocator.close();
             }
-            keyToRowIdCache.clear();
+            memoryIndex.clear();
             log.info("Closed VAST DB store: {}", tableName);
         } catch (Exception e) {
             throw new PermanentBackendException("Failed to close store: " + tableName, e);
         }
     }
     
-    private VectorSchemaRoot queryRowsForKey(StaticBuffer key, SliceQuery slice) throws BackendException {
-        try {
-            // This is a simplified implementation. In reality, we would need to:
-            // 1. Query VAST DB for all rows where key matches
-            // 2. Filter by column range if specified
-            // 3. Apply limits and ordering
-            
-            // For now, return null to indicate no results
-            // A full implementation would construct appropriate Arrow vectors
-            // and query the VAST table
-            
-            return null;
-            
-        } catch (Exception e) {
-            throw convertException(e);
-        }
-    }
-    
-    private List<Entry> parseResultsToEntries(VectorSchemaRoot results) {
-        List<Entry> entries = new ArrayList<>();
+    private boolean isColumnInSlice(StaticBuffer column, SliceQuery slice) {
+        StaticBuffer sliceStart = slice.getSliceStart();
+        StaticBuffer sliceEnd = slice.getSliceEnd();
         
-        try {
-            VarBinaryVector columnVector = (VarBinaryVector) results.getVector("column");
-            VarBinaryVector valueVector = (VarBinaryVector) results.getVector("value");
-            UInt8Vector timestampVector = (UInt8Vector) results.getVector("timestamp");
-            
-            for (int i = 0; i < results.getRowCount(); i++) {
-                if (!columnVector.isNull(i) && !valueVector.isNull(i)) {
-                    byte[] columnBytes = columnVector.get(i);
-                    byte[] valueBytes = valueVector.get(i);
-                    long timestamp = timestampVector.isNull(i) ? 0 : timestampVector.get(i);
-                    
-                    StaticBuffer column = new StaticArrayBuffer(columnBytes);
-                    StaticBuffer value = new StaticArrayBuffer(valueBytes);
-                    
-                    entries.add(new Entry(column, value, timestamp));
-                }
-            }
-        } catch (Exception e) {
-            log.warn("Failed to parse results to entries", e);
+        if (sliceStart != null && sliceStart.length() > 0 && column.compareTo(sliceStart) < 0) {
+            return false;
         }
         
-        return entries;
+        if (sliceEnd != null && sliceEnd.length() > 0 && column.compareTo(sliceEnd) >= 0) {
+            return false;
+        }
+        
+        return true;
     }
     
-    private void performDeletions(StaticBuffer key, List<StaticBuffer> deletions, long timestamp) 
+    private boolean isKeyInRange(StaticBuffer key, KeyRangeQuery query) {
+        StaticBuffer keyStart = query.getKeyStart();
+        StaticBuffer keyEnd = query.getKeyEnd();
+        
+        if (keyStart != null && key.compareTo(keyStart) < 0) {
+            return false;
+        }
+        
+        if (keyEnd != null && key.compareTo(keyEnd) >= 0) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    private void performDeletionsInVastDB(StaticBuffer key, List<StaticBuffer> deletions, long timestamp) 
             throws BackendException {
-        try {
-            // Find and delete rows matching key and columns
-            for (StaticBuffer column : deletions) {
-                // In a full implementation, this would:
-                // 1. Query for rows where key=key AND column=column
-                // 2. Delete those rows using table.delete()
-                
-                log.debug("Deleting column {} for key {}", column, key);
-            }
-            
-        } catch (Exception e) {
-            throw convertException(e);
-        }
+        // Since VAST DB doesn't support SQL DELETE, we would need to:
+        // 1. Find the row IDs of rows to delete (requires maintaining a row ID index)
+        // 2. Use table.delete() with those row IDs
+        
+        // For now, log the operation
+        log.debug("Performing deletions in VAST DB for key {} (not fully implemented)", key);
+        
+        // TODO: Implement proper deletion using row IDs
     }
     
-    private void performAdditions(StaticBuffer key, List<Entry> additions, long timestamp) 
+    private void performAdditionsInVastDB(StaticBuffer key, List<Entry> additions, long timestamp) 
             throws BackendException {
         try {
             int batchSize = configuration.get(VASTDB_BATCH_SIZE);
@@ -370,6 +413,9 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
             
             VectorSchemaRoot insertedRowIds = table.put(recordBatch);
             
+            // TODO: Store row IDs for future deletion support
+            processInsertedRowIds(key, additions, insertedRowIds);
+            
             // Clean up
             recordBatch.close();
             insertedRowIds.close();
@@ -377,6 +423,12 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
         } catch (Exception e) {
             throw convertException(e);
         }
+    }
+    
+    private void processInsertedRowIds(StaticBuffer key, List<Entry> additions, VectorSchemaRoot rowIds) {
+        // Store the mapping of key+column -> rowId for future deletion support
+        // This would require a separate index structure in a production implementation
+        log.debug("Processed {} inserted row IDs for key {}", rowIds.getRowCount(), key);
     }
     
     private void ensureInitialized() throws BackendException {
@@ -395,4 +447,3 @@ public class VastDBKeyColumnValueStore implements KeyColumnValueStore {
         }
     }
 }
-    

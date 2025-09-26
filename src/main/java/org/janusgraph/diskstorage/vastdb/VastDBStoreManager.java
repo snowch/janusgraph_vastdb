@@ -15,6 +15,12 @@
 package org.janusgraph.diskstorage.vastdb;
 
 import com.google.common.base.Preconditions;
+import com.vastdata.client.VastClient;
+import com.vastdata.client.error.VastException;
+import com.vastdata.client.schema.DropTableContext;
+import com.vastdata.client.schema.StartTransactionContext;
+import com.vastdata.client.schema.VastMetadataUtils;
+import com.vastdata.client.tx.SimpleVastTransaction;
 import com.vastdata.vdb.sdk.VastSdk;
 import com.vastdata.vdb.sdk.VastSdkConfig;
 import io.airlift.http.client.HttpClient;
@@ -35,9 +41,11 @@ import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.time.temporal.ChronoUnit;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 import static org.janusgraph.diskstorage.vastdb.VastDBConfigOptions.*;
 
@@ -52,6 +60,7 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
     
     private final VastSdk vastSdk;
     private final String keyspace;
+    private final VastDBTransactionManager transactionManager;
     
     public VastDBStoreManager(Configuration configuration) throws BackendException {
         super(configuration);
@@ -72,6 +81,9 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
             VastSdkConfig config = new VastSdkConfig(uri, uri.toString(), awsAccessKeyId, awsSecretAccessKey);
             HttpClient httpClient = new JettyHttpClient();
             this.vastSdk = new VastSdk(httpClient, config);
+            
+            // Initialize transaction manager
+            this.transactionManager = new VastDBTransactionManager(vastSdk.getVastClient());
             
             // Initialize keyspace/schema if it doesn't exist
             initializeKeyspace();
@@ -102,9 +114,21 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
     private void initializeKeyspace() throws BackendException {
         try {
             // Create schema/keyspace in VAST DB if it doesn't exist
-            // This would use the internal VAST client API similar to the example
             log.info("Initializing VAST DB keyspace: {}", keyspace);
-            // Implementation would create the schema using VastClient if needed
+            
+            SimpleVastTransaction tx = transactionManager.startTransaction(
+                new StartTransactionContext(false, false));
+            
+            VastClient client = vastSdk.getVastClient();
+            
+            if (!client.schemaExists(tx, keyspace)) {
+                client.createSchema(tx, keyspace,
+                    new VastMetadataUtils().getPropertiesString(Collections.emptyMap()));
+                log.info("Created VAST DB keyspace: {}", keyspace);
+            }
+            
+            transactionManager.commit(tx);
+            
         } catch (Exception e) {
             throw new PermanentBackendException("Failed to initialize keyspace: " + keyspace, e);
         }
@@ -136,9 +160,22 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
             log.warn("Clearing all data in VAST DB keyspace: {}", keyspace);
             
             // Drop all tables in the keyspace
-            for (String storeName : stores.keySet()) {
-                dropTable(storeName);
-            }
+            SimpleVastTransaction tx = transactionManager.startTransaction(
+                new StartTransactionContext(false, false));
+            
+            VastClient client = vastSdk.getVastClient();
+            
+            Stream<String> tables = client.listTables(tx, keyspace, 100);
+            tables.forEach(tableName -> {
+                try {
+                    client.dropTable(tx, new DropTableContext(keyspace, tableName));
+                    log.info("Dropped table: {}/{}", keyspace, tableName);
+                } catch (VastException e) {
+                    log.warn("Failed to drop table: {}/{}", keyspace, tableName, e);
+                }
+            });
+            
+            transactionManager.commit(tx);
             stores.clear();
             
         } catch (Exception e) {
@@ -150,7 +187,14 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
     public boolean exists() throws BackendException {
         try {
             // Check if keyspace exists in VAST DB
-            return true; // Simplified - would check if keyspace exists
+            SimpleVastTransaction tx = transactionManager.startTransaction(
+                new StartTransactionContext(true, false));
+            
+            boolean exists = vastSdk.getVastClient().schemaExists(tx, keyspace);
+            transactionManager.commit(tx);
+            
+            return exists;
+            
         } catch (Exception e) {
             throw new PermanentBackendException("Failed to check if keyspace exists", e);
         }
@@ -227,20 +271,15 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
         }
     }
     
-    private void dropTable(String tableName) throws BackendException {
-        try {
-            log.info("Dropping table: {}/{}", keyspace, tableName);
-            // Implementation would drop the table using VastClient
-        } catch (Exception e) {
-            throw new PermanentBackendException("Failed to drop table: " + tableName, e);
-        }
-    }
-    
     public VastSdk getVastSdk() {
         return vastSdk;
     }
     
     public String getKeyspace() {
         return keyspace;
+    }
+    
+    public VastDBTransactionManager getTransactionManager() {
+        return transactionManager;
     }
 }

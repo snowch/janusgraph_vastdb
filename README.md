@@ -12,10 +12,28 @@ This module provides a JanusGraph storage backend implementation for [VAST Datab
 
 ## Requirements
 
-- JanusGraph 1.2.0+
+- JanusGraph 1.0.0+
 - VAST Database 5.3.0+
 - Java 17+
 - Apache Arrow 13.0.0+
+
+## Architecture Limitations & Design
+
+### Important Note: No SQL Support
+
+**VAST Database SDK does not support SQL queries.** This backend implementation uses a hybrid approach:
+
+1. **Data Storage**: All data is stored in VAST DB tables using Apache Arrow format
+2. **Query Processing**: An in-memory index is maintained for query operations since VAST DB doesn't support SQL SELECT/WHERE operations
+3. **Limitations**: This approach has scalability limitations and is suitable for development/testing rather than large-scale production use
+
+### Recommended Production Approach
+
+For production deployments, consider:
+
+1. **External Indexing**: Use a separate indexing system (Redis, Elasticsearch) alongside VAST DB storage
+2. **Custom Query Engine**: Implement a query engine that can efficiently scan VAST DB tables
+3. **Hybrid Storage**: Use VAST DB for bulk storage with a faster database for indexes
 
 ## Configuration
 
@@ -63,25 +81,15 @@ export VASTDB_AWS_SECRET_ACCESS_KEY=your-secret-key
 | `storage.vastdb.max-retry-attempts` | Maximum retry attempts for failed operations | `3` |
 | `storage.vastdb.retry-delay-ms` | Initial delay between retry attempts | `100` |
 
-## Architecture
-
-### Data Model
-
-JanusGraph's key-column-value model is mapped to VAST Database tables as follows:
-
-- **Key**: Row identifier (stored in `key` column)
-- **Column**: Column name within the row (stored in `column` column) 
-- **Value**: Column value (stored in `value` column)
-- **Timestamp**: Modification timestamp (stored in `timestamp` column)
-- **Row ID**: VAST's internal row identifier (`vastdb_rowid`)
-
-Each JanusGraph "store" (vertex store, edge store, index stores, etc.) becomes a separate VAST table.
+## Data Model
 
 ### Table Schema
 
+JanusGraph's key-column-value model is mapped to VAST Database tables as follows:
+
 ```sql
 CREATE TABLE keyspace.jg_store_name (
-    vastdb_rowid UInt64,    -- VAST internal row ID
+    vastdb_rowid UInt64,    -- VAST internal row ID (required for External RowID)
     key          Binary,     -- JanusGraph key
     column       Binary,     -- JanusGraph column  
     value        Binary,     -- JanusGraph value
@@ -89,14 +97,22 @@ CREATE TABLE keyspace.jg_store_name (
 );
 ```
 
+### Query Processing
+
+Since VAST DB doesn't support SQL queries:
+
+1. **Writes**: Data is written directly to VAST DB tables using Arrow format
+2. **Reads**: An in-memory index maps keys to their column-value pairs
+3. **Scans**: Key iteration uses the in-memory index for filtering and range queries
+
 ### Transaction Handling
 
 VAST Database doesn't support distributed ACID transactions, so this backend provides:
 
-- **Atomicity**: Individual operations are atomic
+- **Atomicity**: Individual Arrow batch operations are atomic
 - **Consistency**: Data consistency maintained through careful operation ordering
-- **Isolation**: Read-committed isolation level
-- **Durability**: All operations are immediately durable
+- **Isolation**: Read-committed isolation level via in-memory index
+- **Durability**: All operations are immediately durable in VAST DB
 
 ## Usage Examples
 
@@ -141,6 +157,32 @@ Then open the graph:
 JanusGraph graph = JanusGraphFactory.open("janusgraph-vastdb.properties");
 ```
 
+## Limitations
+
+### Current Implementation Limitations
+
+- **Memory Constraints**: In-memory indexing limits scalability
+- **Query Performance**: No native query optimization from VAST DB
+- **Delete Operations**: Row-level deletes not fully implemented (requires row ID tracking)
+- **Data Loading**: Cannot efficiently load existing data from VAST DB tables
+- **Locking**: No distributed locking support
+- **TTL**: No native cell-level time-to-live support
+
+### VAST Database Requirements  
+
+- Tables must have **External RowID** enabled with **Internal RowID Allocation**
+- First insertion determines allocation strategy (don't include `vastdb_rowid` in first batch)
+- Only `get`, `put`, and `delete` operations supported via SDK
+- No SQL query support
+
+### Scalability Concerns
+
+This implementation is **not recommended for production use** with large datasets due to:
+
+1. **Memory Usage**: All keys maintained in memory
+2. **Startup Time**: No mechanism to reload existing data
+3. **Query Limitations**: Cannot leverage VAST DB's columnar query capabilities
+
 ## Performance Considerations
 
 ### Batch Operations
@@ -149,32 +191,17 @@ JanusGraph graph = JanusGraphFactory.open("janusgraph-vastdb.properties");
 - Larger batches improve throughput but use more memory
 - Monitor VAST cluster performance and adjust accordingly
 
-### Indexing Strategy
+### Memory Management
 
-- Use external index backends (Elasticsearch, Solr) for complex queries
-- VAST provides efficient range scans for simple key-based access
-- Consider VAST's built-in indexing capabilities for performance
+- Monitor JVM heap usage as graph size grows
+- Consider implementing LRU cache for memory index
+- Use appropriate JVM memory settings
 
 ### Schema Design
 
-- Design your graph schema to leverage VAST's columnar storage
-- Group related properties to minimize cross-table joins
-- Use appropriate data types to optimize storage and query performance
-
-## Limitations
-
-### Current Limitations
-
-- **Locking**: No distributed locking support (not required for most graph operations)
-- **TTL**: No native cell-level time-to-live support
-- **Transactions**: Limited transaction semantics (immediate durability, no rollback)
-- **Schema Evolution**: Manual schema changes may be required for major upgrades
-
-### VAST Database Requirements  
-
-- Tables must have **External RowID** enabled with **Internal RowID Allocation**
-- First insertion determines allocation strategy (don't include `vastdb_rowid` in first batch)
-- Only `get`, `put`, and `delete` operations supported (no `update`)
+- Design your graph schema to minimize key diversity
+- Group related properties to reduce memory overhead
+- Consider using shorter key representations
 
 ## Testing
 
@@ -247,10 +274,11 @@ Add the VAST Database Maven repository to your `pom.xml`:
 
 ### Common Issues
 
-1. **Connection Timeout**: Increase `connection-timeout-ms` and `read-timeout-ms`
-2. **Authentication Errors**: Verify AWS credentials have proper VAST Database permissions
-3. **Schema Errors**: Ensure tables have correct External RowID configuration
-4. **Performance Issues**: Adjust batch size and monitor VAST cluster metrics
+1. **Memory Issues**: Increase JVM heap size with `-Xmx` settings
+2. **Connection Timeout**: Increase `connection-timeout-ms` and `read-timeout-ms`
+3. **Authentication Errors**: Verify AWS credentials have proper VAST Database permissions
+4. **Schema Errors**: Ensure tables have correct External RowID configuration
+5. **Performance Issues**: Monitor memory usage and consider data partitioning
 
 ### Logging
 
@@ -264,10 +292,31 @@ Enable debug logging for the VAST backend:
 ### Monitoring
 
 Monitor key metrics:
-- Query latency and throughput
+- JVM heap memory usage
+- In-memory index size
 - VAST cluster CPU and memory usage  
 - Network I/O between JanusGraph and VAST
 - Error rates and retry attempts
+
+## Future Improvements
+
+### Possible Enhancements
+
+1. **Persistent Indexing**: Implement persistent index storage in VAST DB
+2. **Lazy Loading**: Load index data on-demand rather than keeping everything in memory
+3. **Query Optimization**: Develop custom query engine for VAST DB scanning
+4. **Compression**: Implement key compression for memory efficiency
+5. **Sharding**: Support horizontal partitioning across multiple VAST tables
+
+### Production Readiness
+
+To make this backend production-ready:
+
+1. Replace in-memory indexing with persistent solution
+2. Implement efficient data loading mechanisms
+3. Add comprehensive monitoring and metrics
+4. Optimize for VAST DB's columnar storage characteristics
+5. Implement proper row-level delete functionality
 
 ## Contributing
 
@@ -295,3 +344,4 @@ For issues and questions:
 - [JanusGraph Documentation](https://docs.janusgraph.org/)
 - [VAST Database Documentation](https://support.vastdata.com/)
 - [Apache Arrow Documentation](https://arrow.apache.org/docs/)
+- [VAST Database Java SDK Example](./java-sdk-example/README.md)
