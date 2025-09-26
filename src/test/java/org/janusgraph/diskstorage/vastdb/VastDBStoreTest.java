@@ -16,12 +16,16 @@ package org.janusgraph.diskstorage.vastdb;
 
 import org.janusgraph.diskstorage.Entry;
 import org.janusgraph.diskstorage.StaticBuffer;
+import org.janusgraph.diskstorage.BaseTransactionConfig;
 import org.janusgraph.diskstorage.configuration.Configuration;
+import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.KeySliceQuery;
 import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.janusgraph.diskstorage.util.StaticArrayEntry;
+import org.janusgraph.diskstorage.util.time.TimestampProvider;
+import org.janusgraph.diskstorage.util.time.TimestampProviders;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Disabled;
@@ -29,6 +33,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 
 import static org.janusgraph.diskstorage.vastdb.VastDBConfigOptions.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -61,10 +67,78 @@ public class VastDBStoreTest {
         log.info("Configuration options test passed");
     }
     
+    /**
+     * Create a test BaseTransactionConfig for testing.
+     */
+    private BaseTransactionConfig createTestTransactionConfig() {
+        // Instead of implementing BaseTransactionConfig manually, let's try a different approach
+        // Use the VastDBTransaction itself to create a proper config
+        
+        // Create a simple mock config that should work
+        Configuration config = createTestConfiguration();
+        
+        // Create a minimal implementation that extends an existing class if possible
+        // or use a different approach entirely
+        return new TestTransactionConfig(config);
+    }
+    
+    /**
+     * Simple test implementation of BaseTransactionConfig
+     */
+    private static class TestTransactionConfig implements BaseTransactionConfig {
+        private final Configuration config;
+        private Instant commitTime = Instant.now();
+        
+        public TestTransactionConfig(Configuration config) {
+            this.config = config;
+        }
+        
+        @Override
+        public Instant getCommitTime() {
+            return commitTime;
+        }
+        
+        @Override
+        public void setCommitTime(Instant time) {
+            this.commitTime = time;
+        }
+        
+        @Override
+        public boolean hasCommitTime() {
+            return commitTime != null;
+        }
+        
+        @Override
+        public Configuration getCustomOptions() {
+            return config;
+        }
+        
+        @Override
+        public <V> V getCustomOption(ConfigOption<V> option) {
+            return config.get(option);
+        }
+        
+        @Override
+        public TimestampProvider getTimestampProvider() {
+            return TimestampProviders.MICRO;
+        }
+        
+        @Override
+        public boolean hasGroupName() {
+            return false;
+        }
+        
+        @Override
+        public String getGroupName() {
+            return null;
+        }
+    }
+    
     @Test
     public void testVastDBTransactionCreation() {
         // Test VastDBTransaction creation and basic lifecycle
-        VastDBTransaction transaction = new VastDBTransaction(null);
+        BaseTransactionConfig config = createTestTransactionConfig();
+        VastDBTransaction transaction = new VastDBTransaction(config);
         
         assertTrue(transaction.isActive(), "New transaction should be active");
         assertFalse(transaction.isCommitted(), "New transaction should not be committed");
@@ -78,7 +152,8 @@ public class VastDBStoreTest {
     
     @Test
     public void testVastDBTransactionCommit() {
-        VastDBTransaction transaction = new VastDBTransaction(null);
+        BaseTransactionConfig config = createTestTransactionConfig();
+        VastDBTransaction transaction = new VastDBTransaction(config);
         
         assertTrue(transaction.isActive(), "New transaction should be active");
         
@@ -93,7 +168,8 @@ public class VastDBStoreTest {
     
     @Test 
     public void testVastDBTransactionRollback() {
-        VastDBTransaction transaction = new VastDBTransaction(null);
+        BaseTransactionConfig config = createTestTransactionConfig();
+        VastDBTransaction transaction = new VastDBTransaction(config);
         
         assertTrue(transaction.isActive(), "New transaction should be active");
         
