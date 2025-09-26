@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  janusgraph-vastdb:
+    build: .
+    ports:
+      - "8182:8182"
+    environment:
+      - VASTDB_ENDPOINT=${VASTDB_ENDPOINT}
+      - VASTDB_AWS_ACCESS_KEY_ID=${VASTDB_AWS_ACCESS_KEY_ID}
+      - VASTDB_AWS_SECRET_ACCESS_KEY=${VASTDB_AWS_SECRET_ACCESS_KEY}
