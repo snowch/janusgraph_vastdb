@@ -15,28 +15,26 @@
 package org.janusgraph.diskstorage.vastdb;
 
 import com.google.common.base.Preconditions;
-import com.vastdata.client.error.VastException;
 import com.vastdata.vdb.sdk.VastSdk;
 import com.vastdata.vdb.sdk.VastSdkConfig;
 import io.airlift.http.client.HttpClient;
 import io.airlift.http.client.jetty.JettyHttpClient;
-import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.BaseTransactionConfig;
 import org.janusgraph.diskstorage.PermanentBackendException;
 import org.janusgraph.diskstorage.StaticBuffer;
-import org.janusgraph.diskstorage.StoreMetaData;
 import org.janusgraph.diskstorage.common.AbstractStoreManager;
 import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyColumnValueStore;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyColumnValueStoreManager;
 import org.janusgraph.diskstorage.keycolumnvalue.StandardStoreFeatures;
+import org.janusgraph.diskstorage.keycolumnvalue.StoreFeatures;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.URI;
-import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -98,7 +96,6 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
             .multiQuery(true)
             .batchMutation(true)
             .localKeyPartition(false)
-            .visibility(StandardStoreFeatures.Visibility.LOCAL)
             .build();
     }
     
@@ -160,7 +157,7 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
     }
     
     @Override
-    public StandardStoreFeatures getFeatures() {
+    public StoreFeatures getFeatures() {
         return features;
     }
     
@@ -170,12 +167,7 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
     }
     
     @Override
-    public List<KeyColumnValueStore> openStores(String... names) throws BackendException {
-        return super.openStores(names);
-    }
-    
-    @Override
-    public KeyColumnValueStore openDatabase(String name, StoreMetaData metaData) throws BackendException {
+    public KeyColumnValueStore openDatabase(String name) throws BackendException {
         Preconditions.checkNotNull(name);
         
         if (stores.containsKey(name)) {
@@ -200,24 +192,33 @@ public class VastDBStoreManager extends AbstractStoreManager implements KeyColum
     }
     
     @Override
-    public void mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> mutations, 
+    public List<KeyColumnValueStore> openDatabases(String... names) throws BackendException {
+        List<KeyColumnValueStore> stores = new java.util.ArrayList<>();
+        for (String name : names) {
+            stores.add(openDatabase(name));
+        }
+        return stores;
+    }
+    
+    @Override
+    public void mutateMany(Map<String, Map<StaticBuffer, org.janusgraph.diskstorage.keycolumnvalue.KCVMutation>> mutations, 
                           StoreTransaction txh) throws BackendException {
         // Batch mutations across multiple stores
         try {
-            for (Map.Entry<String, Map<StaticBuffer, KCVMutation>> storeEntry : mutations.entrySet()) {
+            for (Map.Entry<String, Map<StaticBuffer, org.janusgraph.diskstorage.keycolumnvalue.KCVMutation>> storeEntry : mutations.entrySet()) {
                 String storeName = storeEntry.getKey();
-                Map<StaticBuffer, KCVMutation> storeMutations = storeEntry.getValue();
+                Map<StaticBuffer, org.janusgraph.diskstorage.keycolumnvalue.KCVMutation> storeMutations = storeEntry.getValue();
                 
-                KeyColumnValueStore store = openDatabase(storeName, StoreMetaData.EMPTY);
-                for (Map.Entry<StaticBuffer, KCVMutation> mutation : storeMutations.entrySet()) {
+                KeyColumnValueStore store = openDatabase(storeName);
+                for (Map.Entry<StaticBuffer, org.janusgraph.diskstorage.keycolumnvalue.KCVMutation> mutation : storeMutations.entrySet()) {
                     StaticBuffer key = mutation.getKey();
-                    KCVMutation kcvMutation = mutation.getValue();
+                    org.janusgraph.diskstorage.keycolumnvalue.KCVMutation kcvMutation = mutation.getValue();
                     
                     if (kcvMutation.hasAdditions()) {
-                        store.mutate(key, kcvMutation.getAdditions(), KCVMutation.EMPTY_DELETIONS, txh);
+                        store.mutate(key, kcvMutation.getAdditions(), java.util.Collections.emptyList(), txh);
                     }
                     if (kcvMutation.hasDeletions()) {
-                        store.mutate(key, KCVMutation.EMPTY_ADDITIONS, kcvMutation.getDeletions(), txh);
+                        store.mutate(key, java.util.Collections.emptyList(), kcvMutation.getDeletions(), txh);
                     }
                 }
             }
